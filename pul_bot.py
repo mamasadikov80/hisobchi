@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 import re
 import sqlite3
@@ -67,7 +68,75 @@ try:
 except Exception:
     pass
 
+# 3. Foydalanuvchilar jadvali (barcha foydalanuvchilarni kuzatish uchun)
+db.execute("""CREATE TABLE IF NOT EXISTS users(
+    user_id INTEGER PRIMARY KEY,
+    first_name TEXT,
+    last_name TEXT,
+    username TEXT,
+    created_at TEXT DEFAULT (datetime('now','+5 hours')),
+    last_active TEXT DEFAULT (datetime('now','+5 hours'))
+)""")
+
+# 4. Adminlar jadvali (rahbar va boshqaruvchilar)
+db.execute("""CREATE TABLE IF NOT EXISTS admins(
+    user_id INTEGER PRIMARY KEY,
+    created_at TEXT DEFAULT (datetime('now','+5 hours'))
+)""")
+
+# Mavjud tranzaksiyalar va qarzdorliklardagi foydalanuvchilarni saqlab qolish (Zero Data Loss)
+try:
+    db.execute("""
+        INSERT OR IGNORE INTO users (user_id, first_name, last_name, username, created_at, last_active)
+        SELECT DISTINCT user, 'Foydalanuvchi ' || user, '', '', datetime('now', '+5 hours'), datetime('now', '+5 hours')
+        FROM t WHERE user IS NOT NULL
+        UNION
+        SELECT DISTINCT user, 'Foydalanuvchi ' || user, '', '', datetime('now', '+5 hours'), datetime('now', '+5 hours')
+        FROM debts WHERE user IS NOT NULL
+    """)
+    for adm_id in [8042453163, 874784622]:
+        db.execute("INSERT OR IGNORE INTO admins(user_id) VALUES(?)", (adm_id,))
+    db.commit()
+except Exception:
+    pass
+
 db.commit()
+
+# Admin ID lari (Asosiy rahbar)
+ADMIN_IDS = {8042453163, 874784622}
+
+
+def is_admin(user_id: int) -> bool:
+    """Foydalanuvchi admin yoki rahbar ekanligini tekshirish"""
+    if user_id in ADMIN_IDS:
+        return True
+    try:
+        row = db.execute("SELECT 1 FROM admins WHERE user_id = ?", (user_id,)).fetchone()
+        return bool(row)
+    except Exception:
+        return False
+
+
+def track_user(user):
+    """Foydalanuvchi ma'lumotlarini bazada xavfsiz saqlash va yangilash"""
+    if not user:
+        return
+    try:
+        fn = user.first_name or ""
+        ln = user.last_name or ""
+        un = user.username or ""
+        db.execute("""
+            INSERT INTO users(user_id, first_name, last_name, username, created_at, last_active)
+            VALUES(?, ?, ?, ?, datetime('now', '+5 hours'), datetime('now', '+5 hours'))
+            ON CONFLICT(user_id) DO UPDATE SET
+                first_name = CASE WHEN excluded.first_name != '' THEN excluded.first_name ELSE users.first_name END,
+                last_name = CASE WHEN excluded.last_name != '' THEN excluded.last_name ELSE users.last_name END,
+                username = CASE WHEN excluded.username != '' THEN excluded.username ELSE users.username END,
+                last_active = datetime('now', '+5 hours')
+        """, (user.id, fn, ln, un))
+        db.commit()
+    except Exception:
+        pass
 
 
 def fmt(n: int) -> str:
@@ -143,6 +212,21 @@ MAIN_KEYBOARD = [
 ]
 MAIN_REPLY_MARKUP = ReplyKeyboardMarkup(MAIN_KEYBOARD, resize_keyboard=True)
 
+
+def get_main_markup(user_id: int) -> ReplyKeyboardMarkup:
+    """Adminlar uchun boshqaruv tugmasi (👑 Admin Panel) qo'shilgan asosiy menyu"""
+    kb = [
+        [KeyboardButton("➕ Доход / Kirim"), KeyboardButton("➖ Расход / Chiqim")],
+        [KeyboardButton("📕 Qarz daftari (Долги)")],
+        [KeyboardButton("📊 Общий отчет"), KeyboardButton("📅 Отчет за сегодня")],
+        [KeyboardButton("📋 История (Tarix)"), KeyboardButton("🗑 Отменить последнее")],
+        [KeyboardButton("🖼 Chiroyli Fon"), KeyboardButton("ℹ️ Помощь / Yordam")]
+    ]
+    if is_admin(user_id):
+        kb.append([KeyboardButton("👑 Admin Panel (Boshqaruv)")])
+    return ReplyKeyboardMarkup(kb, resize_keyboard=True)
+
+
 # Qarz daftari menyusi
 DEBT_KEYBOARD = [
     [KeyboardButton("🟢 Qarz berdim (Menga berishadi)"), KeyboardButton("🔴 Qarz oldim (Men berishim kerak)")],
@@ -151,6 +235,14 @@ DEBT_KEYBOARD = [
     [KeyboardButton("🔙 Asosiy menyu")]
 ]
 DEBT_REPLY_MARKUP = ReplyKeyboardMarkup(DEBT_KEYBOARD, resize_keyboard=True)
+
+# Admin paneli menyusi
+ADMIN_KEYBOARD = [
+    [KeyboardButton("👥 Barcha foydalanuvchilar"), KeyboardButton("📊 Umumiy kassa")],
+    [KeyboardButton("🔍 Foydalanuvchini ko'rish"), KeyboardButton("📢 Hammaga xabar")],
+    [KeyboardButton("🔙 Asosiy menyu")]
+]
+ADMIN_REPLY_MARKUP = ReplyKeyboardMarkup(ADMIN_KEYBOARD, resize_keyboard=True)
 
 
 def make_debt_share_url(name: str, amount: int, curr: str, note: str = "-") -> str:
@@ -167,8 +259,6 @@ def make_debt_share_url(name: str, amount: int, curr: str, note: str = "-") -> s
         msg += f"📝 Sababi / Izoh: {note}\n"
     msg += "\nIltimos, ushbu qarzni o'z vaqtida to'lab, hisob-kitobni yopishingizni so'raymiz! 🤝"
     return f"https://t.me/share/url?text={urllib.parse.quote(msg)}"
-
-
 
 
 def parse_natural_uzbek_text(raw_text: str):
@@ -318,14 +408,17 @@ async def send_summary(update: Update, user_id: int, title: str, where_clause: s
         f"{icon_usd} <b>Qoldiq:</b> {sign_usd}${fmt(usd['bal'])}"
     )
 
+    markup = get_main_markup(user_id)
     if update.callback_query:
-        await update.callback_query.message.reply_text(text, parse_mode="HTML", reply_markup=MAIN_REPLY_MARKUP)
+        await update.callback_query.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
     else:
-        await update.message.reply_text(text, parse_mode="HTML", reply_markup=MAIN_REPLY_MARKUP)
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
 
 
 async def send_wallpaper_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Fon rasmini yuborish va o'rnatish yo'riqnomasi"""
+    uid = update.effective_user.id
+    track_user(update.effective_user)
     caption = (
         "🖼 <b>Mana bu botingiz uchun maxsus 3D fon rasmi!</b>\n\n"
         "Buni ushbu chatning orqa foni (обои) qilib qo'yish uchun:\n"
@@ -334,20 +427,26 @@ async def send_wallpaper_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         "3️⃣ <b>«Установить как обои»</b> (Fon qilib o'rnatish) ni tanlang!\n\n"
         "<i>Shunda butun chat foni zamonaviy va chiroyli bo'ladi! ✨</i>"
     )
+    markup = get_main_markup(uid)
     if os.path.exists(FON_PATH):
         try:
             with open(FON_PATH, "rb") as f:
-                await update.message.reply_photo(photo=f, caption=caption, parse_mode="HTML", reply_markup=MAIN_REPLY_MARKUP)
+                await update.message.reply_photo(photo=f, caption=caption, parse_mode="HTML", reply_markup=markup)
                 return
         except Exception:
             pass
-    await update.message.reply_text("Fon rasmi topilmadi.", reply_markup=MAIN_REPLY_MARKUP)
+    await update.message.reply_text("Fon rasmi topilmadi.", reply_markup=markup)
 
 
 async def start_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/start buyrug'i"""
     ctx.user_data.clear()
-    user_name = update.effective_user.first_name or "Foydalanuvchi"
+    user = update.effective_user
+    track_user(user)
+    uid = user.id
+    user_name = user.first_name or "Foydalanuvchi"
+
+    markup = get_main_markup(uid)
     text = (
         f"Assalomu alaykum, {user_name}! 👋\n\n"
         f"Men shaxsiy <b>Hisob-Kitob va Qarz Daftari</b> botingizman.\n\n"
@@ -362,15 +461,17 @@ async def start_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if os.path.exists(FON_PATH):
         try:
             with open(FON_PATH, "rb") as photo:
-                await update.message.reply_photo(photo=photo, caption=text, parse_mode="HTML", reply_markup=MAIN_REPLY_MARKUP)
+                await update.message.reply_photo(photo=photo, caption=text, parse_mode="HTML", reply_markup=markup)
                 return
         except Exception:
             pass
-    await update.message.reply_text(text, parse_mode="HTML", reply_markup=MAIN_REPLY_MARKUP)
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
 
 
 async def help_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/help buyrug'i"""
+    uid = update.effective_user.id
+    track_user(update.effective_user)
     text = (
         "ℹ️ <b>Qanday yozish mumkin:</b>\n\n"
         "Oddiy gap bilan yozsangiz ham bot nomi bilan tushunib oladi:\n"
@@ -382,12 +483,13 @@ async def help_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "📋 <b>«История (Tarix)»</b> бўлимида чиқимларингиз номи билан чиқади ва пастида <b>ЖАМИ ЧИҚИМ</b> ҳисоблаб берилади!\n"
         "🖼 <b>«Chiroyli Fon»</b> бўлимида чат учун махсус 3D фон расмини ўрнатишингиз мумкин."
     )
-    await update.message.reply_text(text, parse_mode="HTML", reply_markup=MAIN_REPLY_MARKUP)
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=get_main_markup(uid))
 
 
 async def show_debt_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Qarz daftari menyusi"""
     ctx.user_data.clear()
+    track_user(update.effective_user)
     text = (
         "📕 <b>QARZ DAFTARI (So'm va Dollar)</b>\n\n"
         "Bergan va olgan qarzlaringizni hisoblab boring:\n\n"
@@ -401,10 +503,10 @@ async def show_debt_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=DEBT_REPLY_MARKUP)
 
 
-
 async def show_debt_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Qarzdorlar ro'yxati"""
     uid = update.effective_user.id
+    track_user(update.effective_user)
 
     berdim_rows = db.execute(
         "SELECT id, name, amount, currency, note, created_at FROM debts WHERE user = ? AND debt_type = 'berdim' AND is_closed = 0 ORDER BY id DESC",
@@ -479,6 +581,7 @@ async def show_debt_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def send_debt_sms_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Qarzdorlarga OGOHLANTIRISH / SMS yuborish ro'yxati"""
     uid = update.effective_user.id
+    track_user(update.effective_user)
     rows = db.execute(
         "SELECT id, name, amount, currency, note FROM debts WHERE user = ? AND debt_type = 'berdim' AND is_closed = 0 ORDER BY id DESC",
         (uid,)
@@ -507,11 +610,10 @@ async def send_debt_sms_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-
-
 async def close_debt_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Qaysi qarzni yopishni tanlash"""
     uid = update.effective_user.id
+    track_user(update.effective_user)
     rows = db.execute(
         "SELECT id, debt_type, name, amount, currency FROM debts WHERE user = ? AND is_closed = 0 ORDER BY id DESC",
         (uid,)
@@ -541,13 +643,15 @@ async def close_debt_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def ochir_oxirgisi(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Oxirgi yozuvni o'chirish"""
     uid = update.effective_user.id
+    track_user(update.effective_user)
     last_row = db.execute(
         "SELECT id, amount, currency, note FROM t WHERE user = ? ORDER BY id DESC LIMIT 1",
         (uid,)
     ).fetchone()
 
+    markup = get_main_markup(uid)
     if not last_row:
-        await update.message.reply_text("O'chirish uchun kirim-chiqim yozuvi topilmadi.", reply_markup=MAIN_REPLY_MARKUP)
+        await update.message.reply_text("O'chirish uchun kirim-chiqim yozuvi topilmadi.", reply_markup=markup)
         return
 
     db.execute("DELETE FROM t WHERE id = ? AND user = ?", (last_row["id"], uid))
@@ -560,19 +664,22 @@ async def ochir_oxirgisi(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"🗑 <b>Oxirgi yozuv muvaffaqiyatli o'chirildi!</b>\n\n"
         f"<b>#{last_row['id']}</b> | {icon}{fmt_money(last_row['amount'], curr)} (<i>{last_row['note']}</i>)"
     )
-    await update.message.reply_text(text, parse_mode="HTML", reply_markup=MAIN_REPLY_MARKUP)
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
 
 
 async def show_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Tarixni ko'rsatish va oxirida CHIQIMLAR JAMINI hisoblab chiqarish"""
     uid = update.effective_user.id
+    track_user(update.effective_user)
+    markup = get_main_markup(uid)
+
     rows = db.execute(
         "SELECT id, amount, currency, note, date FROM t WHERE user = ? ORDER BY id DESC LIMIT 15",
         (uid,)
     ).fetchall()
 
     if not rows:
-        await update.message.reply_text("📋 Hozircha hech qanday yozuv yo'q.", reply_markup=MAIN_REPLY_MARKUP)
+        await update.message.reply_text("📋 Hozircha hech qanday yozuv yo'q.", reply_markup=markup)
         return
 
     lines = ["📋 <b>OXIRGI AMALLAR TARIXI:</b>\n"]
@@ -626,22 +733,335 @@ async def show_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines.append(f"📊 <b>Barcha davrdagi umumiy chiqim:</b> {fmt(tot_rash_uzs)} so'm" + (f" | ${fmt(tot_rash_usd)}" if tot_rash_usd > 0 else ""))
     lines.append("\n💡 <i>O'chirish uchun: «🗑 Отменить последнее» tugmasini bosing.</i>")
 
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=MAIN_REPLY_MARKUP)
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=markup)
 
+
+# =====================================================================
+# ADMIN PANEL VA BOSHQARUV FUNKSIYALARI (Boshliq uchun)
+# =====================================================================
+
+async def boss_claim_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/boss yoki /rahbar buyrug'i orqali adminlikni biriktirish"""
+    uid = update.effective_user.id
+    track_user(update.effective_user)
+    db.execute("INSERT OR IGNORE INTO admins(user_id) VALUES(?)", (uid,))
+    db.commit()
+    await update.message.reply_text(
+        "👑 <b>Siz bot rahbari (Admin) deb muvaffaqiyatli belgilandingiz!</b>\n\n"
+        "Endi botdagi barcha foydalanuvchilarni va ularning hisob-kitoblarini ko'rishingiz mumkin.",
+        parse_mode="HTML",
+        reply_markup=get_main_markup(uid)
+    )
+    await show_admin_menu(update, ctx)
+
+
+async def show_admin_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin panel bosh oynasi"""
+    uid = update.effective_user.id
+    track_user(update.effective_user)
+    if not is_admin(uid):
+        await update.message.reply_text(
+            "⛔️ Ushbu bo'lim faqat bot rahbari uchun mo'ljallangan.",
+            reply_markup=get_main_markup(uid)
+        )
+        return
+
+    ctx.user_data.clear()
+
+    total_users = db.execute("SELECT COUNT(*) as c FROM users").fetchone()["c"]
+    active_today = db.execute("SELECT COUNT(*) as c FROM users WHERE date(last_active) = date('now', '+5 hours')").fetchone()["c"]
+    total_tx = db.execute("SELECT COUNT(*) as c FROM t").fetchone()["c"]
+    total_debts = db.execute("SELECT COUNT(*) as c FROM debts WHERE is_closed = 0").fetchone()["c"]
+
+    text = (
+        "👑 <b>HURMATLI BOSHLIQ, ADMIN PANELGA XUSH KELIBSIZ!</b>\n\n"
+        "Bu yerda botdan foydalanayotgan barcha odamlarni va ularning hisob-kitoblarini ko'rishingiz mumkin.\n\n"
+        f"👥 <b>Jami foydalanuvchilar:</b> {total_users} ta\n"
+        f"📅 <b>Bugun faol bo'lganlar:</b> {active_today} ta\n"
+        f"📝 <b>Jami yozuvlar:</b> {total_tx} ta\n"
+        f"📕 <b>Faol ochiq qarzlar:</b> {total_debts} ta\n\n"
+        "👇 <b>Quyidagi bo'limlardan birini tanlang:</b>"
+    )
+
+    if update.callback_query:
+        await update.callback_query.message.reply_text(text, parse_mode="HTML", reply_markup=ADMIN_REPLY_MARKUP)
+    else:
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=ADMIN_REPLY_MARKUP)
+
+
+async def show_admin_users_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Barcha foydalanuvchilar ro'yxati va ularning balanslari"""
+    uid = update.effective_user.id
+    track_user(update.effective_user)
+    if not is_admin(uid):
+        return
+
+    rows = db.execute("SELECT * FROM users ORDER BY last_active DESC").fetchall()
+    if not rows:
+        await update.message.reply_text("Foydalanuvchilar topilmadi.", reply_markup=ADMIN_REPLY_MARKUP)
+        return
+
+    text_parts = [f"👥 <b>BOT FOYDALANUVCHILARI RO'YXATI ({len(rows)} ta):</b>\n"]
+    buttons = []
+
+    for idx, r in enumerate(rows, 1):
+        u_id = r["user_id"]
+        full_name = f"{r['first_name'] or ''} {r['last_name'] or ''}".strip() or f"Foydalanuvchi {u_id}"
+        username_str = f"@{r['username']}" if r["username"] else "mavjud emas"
+        dt = format_date(r["last_active"])
+
+        totals = get_totals_by_currency(u_id)
+        uzs_bal = totals["UZS"]["bal"]
+        usd_bal = totals["USD"]["bal"]
+
+        debts_cnt = db.execute("SELECT COUNT(*) as c FROM debts WHERE user = ? AND is_closed = 0", (u_id,)).fetchone()["c"]
+
+        bal_str = f"Qoldiq: {fmt(uzs_bal)} so'm"
+        if usd_bal != 0:
+            bal_str += f" | ${fmt(usd_bal)}"
+
+        user_info = (
+            f"<b>{idx}. {full_name}</b> ({username_str})\n"
+            f"   🆔 ID: <code>{u_id}</code> | 🕒 {dt}\n"
+            f"   💰 {bal_str}\n"
+            f"   📕 Ochiq qarzlari: {debts_cnt} ta\n"
+        )
+        text_parts.append(user_info)
+
+        btn_label = f"🔍 #{idx} {full_name[:15]} hisoboti"
+        buttons.append([InlineKeyboardButton(btn_label, callback_data=f"adm_user:{u_id}")])
+
+    full_text = "\n".join(text_parts)
+    if len(full_text) > 4000:
+        full_text = full_text[:3950] + "\n\n<i>...va boshqa foydalanuvchilar</i>"
+
+    if update.callback_query:
+        await update.callback_query.message.reply_text(
+            full_text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(buttons) if buttons else ADMIN_REPLY_MARKUP
+        )
+    else:
+        await update.message.reply_text(
+            full_text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(buttons) if buttons else ADMIN_REPLY_MARKUP
+        )
+
+
+async def show_admin_user_detail(update: Update, target_user_id: int):
+    """Biror bir foydalanuvchining to'liq hisob-kitobini ko'rish"""
+    user_row = db.execute("SELECT * FROM users WHERE user_id = ?", (target_user_id,)).fetchone()
+    name = f"{user_row['first_name'] or ''} {user_row['last_name'] or ''}".strip() if user_row else f"Foydalanuvchi {target_user_id}"
+    username = f"@{user_row['username']}" if (user_row and user_row['username']) else "mavjud emas"
+    last_act = format_date(user_row['last_active']) if user_row else "noma'lum"
+
+    totals = get_totals_by_currency(target_user_id)
+    uzs = totals["UZS"]
+    usd = totals["USD"]
+
+    tx_rows = db.execute("SELECT * FROM t WHERE user = ? ORDER BY id DESC LIMIT 10", (target_user_id,)).fetchall()
+    debt_rows = db.execute("SELECT * FROM debts WHERE user = ? AND is_closed = 0 ORDER BY id DESC", (target_user_id,)).fetchall()
+
+    lines = [
+        f"👤 <b>FOYDALANUVCHI HISOBI:</b>",
+        f"Ismi: <b>{name}</b> ({username})",
+        f"ID: <code>{target_user_id}</code> | Oxirgi faollik: 🕒 {last_act}\n",
+        f"📊 <b>BALANSI:</b>",
+        f"🇺🇿 So'mda: Kirim: {fmt(uzs['doh'])} | Chiqim: {fmt(uzs['rash'])} | <b>Qoldiq: {fmt(uzs['bal'])} so'm</b>",
+        f"🇺🇸 Dollarda: Kirim: ${fmt(usd['doh'])} | Chiqim: ${fmt(usd['rash'])} | <b>Qoldiq: ${fmt(usd['bal'])}</b>\n",
+        f"📋 <b>OXIRGI AMALLARI (Tranzaksiyalar):</b>"
+    ]
+
+    if not tx_rows:
+        lines.append("  <i>Hozircha yozuvlar yo'q</i>")
+    else:
+        for r in tx_rows:
+            amt = r["amount"]
+            curr = r["currency"] or "UZS"
+            icon = "🟢 +" if amt > 0 else "🔴 -"
+            dt = format_date(r["date"])
+            lines.append(f"  <b>#{r['id']}</b> | {icon}{fmt_money(amt, curr)} | <i>{r['note']}</i> | {dt}")
+
+    lines.append("\n📕 <b>OCHIQ QARZLARI:</b>")
+    if not debt_rows:
+        lines.append("  <i>Qarzlar yo'q</i>")
+    else:
+        for d in debt_rows:
+            d_icon = "🟢 Bergan" if d["debt_type"] == "berdim" else "🔴 Olgan"
+            curr = d["currency"] or "UZS"
+            lines.append(f"  {d_icon}: <b>{d['name']}</b> — {fmt_money(d['amount'], curr)} ({d['note']})")
+
+    res_text = "\n".join(lines)
+    back_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Ro'yxatga qaytish", callback_data="adm_back")]])
+
+    if update.callback_query:
+        await update.callback_query.message.reply_text(res_text, parse_mode="HTML", reply_markup=back_markup)
+    else:
+        await update.message.reply_text(res_text, parse_mode="HTML", reply_markup=back_markup)
+
+
+async def show_admin_kassa(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Barcha foydalanuvchilarning umumiy kassa holati"""
+    uid = update.effective_user.id
+    track_user(update.effective_user)
+    if not is_admin(uid):
+        return
+
+    rows = db.execute("""
+        SELECT 
+            COALESCE(currency, 'UZS') as cur,
+            COALESCE(SUM(CASE WHEN amount > 0 THEN amount END), 0) AS doh,
+            COALESCE(SUM(CASE WHEN amount < 0 THEN -amount END), 0) AS rash
+        FROM t
+        GROUP BY COALESCE(currency, 'UZS')
+    """).fetchall()
+
+    tots = {"UZS": {"doh": 0, "rash": 0, "bal": 0}, "USD": {"doh": 0, "rash": 0, "bal": 0}}
+    for r in rows:
+        c = r["cur"] if r["cur"] in ["UZS", "USD"] else "UZS"
+        d = int(r["doh"])
+        ra = int(r["rash"])
+        tots[c] = {"doh": d, "rash": ra, "bal": d - ra}
+
+    uzs = tots["UZS"]
+    usd = tots["USD"]
+
+    total_users = db.execute("SELECT COUNT(*) as c FROM users").fetchone()["c"]
+    total_tx = db.execute("SELECT COUNT(*) as c FROM t").fetchone()["c"]
+    total_debts = db.execute("SELECT COUNT(*) as c FROM debts WHERE is_closed = 0").fetchone()["c"]
+
+    text = (
+        "📊 <b>BOTNING UMUMIY KASSA VA FOYDALANUVCHILAR STATISTIKASI:</b>\n\n"
+        f"👥 Foydalanuvchilar soni: <b>{total_users} ta</b>\n"
+        f"📝 Jami kiritilgan yozuvlar: <b>{total_tx} ta</b>\n"
+        f"📕 Faol ochiq qarzlar: <b>{total_debts} ta</b>\n\n"
+        "🇺🇿 <b>UMUMIY SO'MDA:</b>\n"
+        f"🟢 Jami kirim: {fmt(uzs['doh'])} so'm\n"
+        f"🔴 Jami chiqim: {fmt(uzs['rash'])} so'm\n"
+        f"💰 <b>Jami aylanma qoldig'i: {fmt(uzs['bal'])} so'm</b>\n\n"
+        "🇺🇸 <b>UMUMIY DOLLARDA ($):</b>\n"
+        f"🟢 Jami kirim: ${fmt(usd['doh'])}\n"
+        f"🔴 Jami chiqim: ${fmt(usd['rash'])}\n"
+        f"💰 <b>Jami aylanma qoldig'i: ${fmt(usd['bal'])}</b>\n\n"
+        "<i>Eslatma: Har bir foydalanuvchi faqat o'z hisob-kitobini ko'radi. Barcha ma'lumotlar xavfsiz saqlanmoqda.</i>"
+    )
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=ADMIN_REPLY_MARKUP)
+
+
+# =====================================================================
+# ASOSIY XABARLAR VA HODISALARNI QAYTA ISHLASH (Message Handlers)
+# =====================================================================
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Barcha xabarlarni qayta ishlash"""
+    if not update.message or not update.message.text:
+        return
     raw_text = update.message.text.strip()
-    uid = update.effective_user.id
+    user = update.effective_user
+    track_user(user)
+    uid = user.id
+    markup = get_main_markup(uid)
 
-    # 1. Asosiy menyu va navigatsiya
+    # 1. Admin buyruqlari va tugmalari
+    if raw_text in ["👑 Admin Panel (Boshqaruv)", "👑 Admin Panel", "Admin Panel", "/admin", "Admin"]:
+        await show_admin_menu(update, ctx)
+        return
+
+    elif raw_text in ["/boss", "/rahbar", "boss", "rahbar"]:
+        await boss_claim_command(update, ctx)
+        return
+
+    elif raw_text in ["👥 Barcha foydalanuvchilar", "👥 Foydalanuvchilar ro'yxati", "/users"]:
+        await show_admin_users_list(update, ctx)
+        return
+
+    elif raw_text in ["📊 Umumiy kassa", "📊 Bot statistikasi", "/kassa"]:
+        await show_admin_kassa(update, ctx)
+        return
+
+    elif raw_text in ["🔍 Foydalanuvchini ko'rish", "🔍 Foydalanuvchini tekshirish"]:
+        if not is_admin(uid):
+            return
+        ctx.user_data["action"] = "admin_check_user"
+        await update.message.reply_text(
+            "🔍 <b>Foydalanuvchi ID raqamini kiriting:</b>\n\n"
+            "Masalan: <code>8042453163</code> yoki <code>7489502905</code>\n"
+            "(Bekor qilish uchun: 'Bekor qilish' deb yozing)",
+            parse_mode="HTML"
+        )
+        return
+
+    elif raw_text in ["📢 Hammaga xabar", "📢 Hammaga xabar yuborish"]:
+        if not is_admin(uid):
+            return
+        ctx.user_data["action"] = "admin_broadcast"
+        await update.message.reply_text(
+            "📢 <b>Barcha foydalanuvchilarga yuboriladigan xabarni yozing:</b>\n\n"
+            "(Bekor qilish uchun: 'Bekor qilish' deb yozing)",
+            parse_mode="HTML"
+        )
+        return
+
+    # Admin faol amallarini tekshirish
+    action = ctx.user_data.get("action")
+    if action == "admin_check_user":
+        if raw_text.lower() in ["bekor", "bekor qilish", "cancel"]:
+            ctx.user_data.pop("action", None)
+            await update.message.reply_text("Bekor qilindi.", reply_markup=ADMIN_REPLY_MARKUP)
+            return
+        digits = re.sub(r"\D", "", raw_text)
+        if digits:
+            target_uid = int(digits)
+            ctx.user_data.pop("action", None)
+            await show_admin_user_detail(update, target_uid)
+            return
+        else:
+            await update.message.reply_text("Iltimos, faqat foydalanuvchi ID raqamini kiriting (masalan: 7489502905):")
+            return
+
+    if action == "admin_broadcast":
+        if raw_text.lower() in ["bekor", "bekor qilish", "cancel"]:
+            ctx.user_data.pop("action", None)
+            await update.message.reply_text("Xabar tarqatish bekor qilindi.", reply_markup=ADMIN_REPLY_MARKUP)
+            return
+        ctx.user_data.pop("action", None)
+        users = db.execute("SELECT DISTINCT user_id FROM users").fetchall()
+        sent_cnt = 0
+        fail_cnt = 0
+        status_msg = await update.message.reply_text("⏳ Xabar barcha foydalanuvchilarga yuborilmoqda...")
+        for u in users:
+            t_id = u["user_id"]
+            try:
+                await ctx.bot.send_message(
+                    chat_id=t_id,
+                    text=f"📢 <b>ADMINISTRATOR XABARI:</b>\n\n{raw_text}",
+                    parse_mode="HTML"
+                )
+                sent_cnt += 1
+            except Exception:
+                fail_cnt += 1
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+        await update.message.reply_text(
+            f"✅ <b>Xabar tarqatildi!</b>\n\n"
+            f"📤 Yuborildi: {sent_cnt} ta foydalanuvchiga\n"
+            f"⚠️ Yetib bormadi (bloklagan): {fail_cnt} ta",
+            parse_mode="HTML",
+            reply_markup=ADMIN_REPLY_MARKUP
+        )
+        return
+
+    # 2. Asosiy menyu va navigatsiya
     if raw_text in ["📕 Qarz daftari (Долги)", "📕 Qarz daftari", "Qarz daftari", "/debts", "/qarz"]:
         await show_debt_menu(update, ctx)
         return
 
     elif raw_text in ["🔙 Asosiy menyu", "🔙 Главное меню", "/menu"]:
         ctx.user_data.clear()
-        await update.message.reply_text("Asosiy menyuga qaytdingiz:", reply_markup=MAIN_REPLY_MARKUP)
+        await update.message.reply_text("Asosiy menyuga qaytdingiz:", reply_markup=markup)
         return
 
     elif raw_text in ["📋 Qarzdorlar ro'yxati", "Qarzdorlar ro'yxati", "/qarzlar"]:
@@ -719,14 +1139,11 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await send_debt_sms_prompt(update, ctx)
         return
 
-
-
     elif raw_text in ["ℹ️ Помощь / Yordam", "ℹ️ Yordam", "ℹ️ Помощь", "/help"]:
         await help_command(update, ctx)
         return
 
-    # 2. Qarz kiritish holati
-    action = ctx.user_data.get("action")
+    # 3. Qarz kiritish holati
     if action in ["debt_berdim", "debt_oldim"]:
         name, amount, curr, note = parse_debt_input(raw_text)
         if amount > 0 and name:
@@ -755,12 +1172,11 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     f"👤 <b>Ism:</b> {name}\n"
                     f"💰 <b>Summa:</b> {fmt_money(amount, curr)}\n"
                     f"📝 <b>Izoh:</b> {note}\n\n"
-                    f"👇 <i>Qarzdorga hoziroq Telegram orqali qarz borligi haqida <b>OGOHLANTIRISH</b> jo'natish учун pastdagi tugmani bosing:</i>",
+                    f"👇 <i>Qarzdorga hoziroq Telegram orqali qarz borligi haqida <b>OGOHLANTIRISH</b> jo'natish uchun pastdagi tugmani bosing:</i>",
                     parse_mode="HTML",
                     reply_markup=InlineKeyboardMarkup(kb_list)
                 )
                 return
-
             else:
                 await update.message.reply_text(
                     f"📕 <b>Qarz daftariga yozildi!</b>\n\n"
@@ -772,7 +1188,6 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     reply_markup=DEBT_REPLY_MARKUP
                 )
                 return
-
         else:
             await update.message.reply_text(
                 "❌ Qarz ma'lumotini tushunmadim.\nMisol: <code>Ali 100$</code> yoki <code>Ali 500000 1 haftaga</code>",
@@ -780,7 +1195,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-    # 3. Jonli matnni tahlil qilish (Natural Language Parser)
+    # 4. Jonli matnni tahlil qilish (Natural Language Parser)
     amount_val, curr, note_val, inf_type = parse_natural_uzbek_text(raw_text)
 
     # Agar foydalanuvchi oldin "➕ Kirim" yoki "➖ Chiqim" tugmasini bosgan bo'lsa
@@ -802,7 +1217,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"Kirim: {fmt_money(c_info['doh'], curr)} | Chiqim: {fmt_money(c_info['rash'], curr)}\n"
                 f"💰 Qoldiq: {fmt_money(c_info['bal'], curr)}",
                 parse_mode="HTML",
-                reply_markup=MAIN_REPLY_MARKUP
+                reply_markup=markup
             )
             return
 
@@ -822,7 +1237,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"Kirim: {fmt_money(c_info['doh'], curr)} | Chiqim: {fmt_money(c_info['rash'], curr)}\n"
             f"💰 Qoldiq: {fmt_money(c_info['bal'], curr)}",
             parse_mode="HTML",
-            reply_markup=MAIN_REPLY_MARKUP
+            reply_markup=markup
         )
         return
 
@@ -853,7 +1268,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "• <code>200,000га атир олдим</code>\n"
         "• <code>500000 ойлик тушди</code>",
         parse_mode="HTML",
-        reply_markup=MAIN_REPLY_MARKUP
+        reply_markup=markup
     )
 
 
@@ -862,7 +1277,24 @@ async def handle_callback_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
-    uid = update.effective_user.id
+    user = update.effective_user
+    track_user(user)
+    uid = user.id
+
+    # Admin boshqaruvi callbacklari
+    if data.startswith("adm_user:"):
+        if not is_admin(uid):
+            await query.answer("Ruxsat berilmagan!", show_alert=True)
+            return
+        target_uid = int(data.split(":")[1])
+        await show_admin_user_detail(update, target_uid)
+        return
+
+    elif data == "adm_back":
+        if not is_admin(uid):
+            return
+        await show_admin_users_list(update, ctx)
+        return
 
     # Qarzni yopish
     if data.startswith("close_debt:"):
@@ -914,7 +1346,6 @@ async def handle_callback_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Bekor qilindi.")
         return
 
-
     # Kirim/Chiqim inline tanlash
     amt = ctx.user_data.get("pending_amount")
     curr = ctx.user_data.get("pending_curr", "UZS")
@@ -962,6 +1393,7 @@ async def handle_callback_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def qarz_yop_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/qarz_yop 5 buyrug'i"""
     uid = update.effective_user.id
+    track_user(update.effective_user)
     if not ctx.args or not ctx.args[0].isdigit():
         await update.message.reply_text("Qarz ID raqamini kiriting. Masalan: <code>/qarz_yop 2</code>", parse_mode="HTML")
         return
@@ -991,7 +1423,7 @@ def main():
         return
 
     print("=" * 60)
-    print("Bot chiroyli fon rasmi bilan ishga tushmoqda...")
+    print("Bot Admin Panel va foydalanuvchilar nazorati bilan ishga tushmoqda...")
     print("=" * 60)
 
     def keep_alive_worker():
@@ -1015,6 +1447,12 @@ def main():
     app.add_handler(CommandHandler("qarz_yop", qarz_yop_command))
     app.add_handler(CommandHandler("close_debt", qarz_yop_command))
 
+    # Admin buyruqlari
+    app.add_handler(CommandHandler("admin", show_admin_menu))
+    app.add_handler(CommandHandler("boss", boss_claim_command))
+    app.add_handler(CommandHandler("rahbar", boss_claim_command))
+    app.add_handler(CommandHandler("users", show_admin_users_list))
+
     # Tugmalar va xabarlar
     app.add_handler(CallbackQueryHandler(handle_callback_query))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
@@ -1024,4 +1462,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
