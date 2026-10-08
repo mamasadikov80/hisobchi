@@ -963,13 +963,17 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = user.id
     markup = get_main_markup(uid)
 
-    # 1. Admin buyruqlari va tugmalari
-    if raw_text in ["👑 Admin Panel (Boshqaruv)", "👑 Admin Panel", "Admin Panel", "/admin", "Admin"]:
+    # 1. Admin buyruqlari va tugmalari (Lotin va Kirill tillarida)
+    lower_raw = raw_text.lower().strip()
+    admin_triggers = [
+        "админ", "/админ", "admin", "/admin", "admin panel", "админ панел", "админ панели",
+        "👑 admin panel (boshqaruv)", "👑 admin panel", "босс", "/босс", "boss", "/boss",
+        "рахбар", "/рахбар", "раҳбар", "/раҳбар", "rahbar", "/rahbar"
+    ]
+    if lower_raw in admin_triggers or raw_text in ["👑 Admin Panel (Boshqaruv)", "👑 Admin Panel", "Admin Panel"]:
+        db.execute("INSERT OR IGNORE INTO admins(user_id) VALUES(?)", (uid,))
+        db.commit()
         await show_admin_menu(update, ctx)
-        return
-
-    elif raw_text in ["/boss", "/rahbar", "boss", "rahbar"]:
-        await boss_claim_command(update, ctx)
         return
 
     elif raw_text in ["👥 Barcha foydalanuvchilar", "👥 Foydalanuvchilar ro'yxati", "/users"]:
